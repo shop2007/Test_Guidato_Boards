@@ -1,120 +1,79 @@
 #include <avr/pgmspace.h>
 
-typedef void (*StepFunction)();
+const byte ledPin = 13;
 
-struct Step {
-  const char* desc;
-  StepFunction execute;
-};
+// Stato corrente
+int currentStepIndex = 0;
+int currentSubStepIndex = 0;
+bool isExecuting = false;
+bool inMenu = false;
 
-// === Descrizioni test in flash memory ===
+// Descrizioni in PROGMEM
 const char desc_1A[] PROGMEM = "1.A - Inizializza DAC";
 const char desc_1B[] PROGMEM = "1.B - Genera triangola 5V 1Hz";
-const char desc_2A[] PROGMEM = "2.A - Attiva relè 1";
-const char desc_2B[] PROGMEM = "2.B - Disattiva relè 1";
+const char desc_1C[] PROGMEM = "1.C - Blink LED finché non premi Q";
 
-// === Funzioni di test ===
-void test_initDAC() {
-  Serial.println(">> DAC inizializzato");
-  delay(500);
-}
+// Tipo Step
+typedef void (*TestFunc)();
+struct Step {
+  const char* description;
+  TestFunc function;
+};
 
-unsigned long lastToggleTime = 0;
-bool waveHigh = false;
-void test_generateTriangola() {
-  unsigned long now = millis();
-  if (now - lastToggleTime >= 500) {
-    lastToggleTime = now;
-    waveHigh = !waveHigh;
-    Serial.println(waveHigh ? "Triangola: +5V" : "Triangola: 0V");
-  }
-}
+// Prototipi
+void test_initDAC();
+void test_generateTriangola();
+void test_blinkLED();
 
-void test_attivaRele() {
-  Serial.println("Relè 1 ON");
-  delay(500);
-}
-
-void test_disattivaRele() {
-  Serial.println("Relè 1 OFF");
-  delay(500);
-}
-
-// === Sequenza dei test ===
+// Sequenza test
 const Step testSequence[][5] PROGMEM = {
   {
     { desc_1A, test_initDAC },
     { desc_1B, test_generateTriangola },
+    { desc_1C, test_blinkLED },
     { nullptr, nullptr }
   },
   {
-    { desc_2A, test_attivaRele },
-    { desc_2B, test_disattivaRele },
+    { desc_1A, test_initDAC }, // per esempio, ripeti per test 2.A ecc.
     { nullptr, nullptr }
   }
 };
 
-const int numMainPoints = sizeof(testSequence) / sizeof(testSequence[0]);
+const int numMainSteps = sizeof(testSequence) / sizeof(testSequence[0]);
 
-// === Stato ===
-int currentMain = 0;
-int currentSub = 0;
-bool isExecuting = false;
-StepFunction currentStepFunction = nullptr;
-
-bool menuMode = false;
-char menuBuffer[4];
-byte menuBufferIndex = 0;
-int totalSteps = 0;
+// Blink non bloccante
+unsigned long lastBlink = 0;
+bool ledState = false;
 
 void setup() {
-  Serial.begin(9600);
-  delay(500);
-  totalSteps = countTotalSteps();
-  Serial.println("Sistema di collaudo pronto.");
+  Serial.begin(115200);
+  pinMode(ledPin, OUTPUT);
   printCurrentStep();
 }
 
 void loop() {
-  // === Gestione modalità menù numerico ===
-  if (menuMode) {
-    while (Serial.available()) {
-      char c = Serial.read();
-      if (isdigit(c) && menuBufferIndex < 3) {
-        menuBuffer[menuBufferIndex++] = c;
-        Serial.write(c);
-      } else if (c == '\n' || c == '\r') {
-        menuBuffer[menuBufferIndex] = '\0';
-        int sel = atoi(menuBuffer);
-        menuMode = false;
-        menuBufferIndex = 0;
-        memset(menuBuffer, 0, sizeof(menuBuffer));
-        if (sel >= 1 && sel <= totalSteps) {
-          gotoStepByIndex(sel);
-          startExecution();
-        } else {
-          Serial.println("\n>> Numero non valido.");
-          printCurrentStep();
-        }
-        return;
-      }
-    }
-    return;
-  }
-
-  // === Esecuzione continua se attiva ===
-  if (isExecuting && currentStepFunction != nullptr) {
-    currentStepFunction();
-  }
-
-  // === Input seriale normale ===
   if (Serial.available()) {
-    char cmd = toupper(Serial.read());
+    char c = Serial.read();
+    if (c == '\n' || c == '\r' || c == ' ') return;
+    char cmd = toupper(c);
 
     if (isExecuting && cmd == 'Q') {
       isExecuting = false;
-      Serial.println(">> Esecuzione interrotta (Q).");
+      Serial.println(F(">> Esecuzione interrotta (Q)"));
       printCurrentStep();
+      return;
+    }
+
+    if (inMenu && isDigit(cmd)) {
+      static int menuIndex = 0;
+      menuIndex = menuIndex * 10 + (cmd - '0');
+      delay(10);
+      if (!Serial.available()) {
+        goToMenuStep(menuIndex - 1);
+        inMenu = false;
+        menuIndex = 0;
+        printCurrentStep();
+      }
       return;
     }
 
@@ -123,131 +82,88 @@ void loop() {
       printCurrentStep();
     }
   }
+
+  if (isExecuting) {
+    Step s;
+    memcpy_P(&s, &testSequence[currentStepIndex][currentSubStepIndex], sizeof(Step));
+    if (s.function) s.function();
+  }
 }
 
-// === Comandi base ===
+// Comandi
 void handleCommand(char cmd) {
   switch (cmd) {
-    case 'A': nextStep(); break;
-    case 'I': prevStep(); break;
-    case 'R': currentSub = 0; break;
-    case 'S': skipToNextMain(); break;
-    case 'E': startExecution(); break;
-    case 'M': enterMenu(); break;
-    default: Serial.println("Comando non valido. Usa A/I/R/S/E/M o Q.");
+    case 'A':
+      currentStepIndex++;
+      currentSubStepIndex = 0;
+      if (currentStepIndex >= numMainSteps) currentStepIndex = numMainSteps - 1;
+      break;
+    case 'I':
+      currentStepIndex--;
+      currentSubStepIndex = 0;
+      if (currentStepIndex < 0) currentStepIndex = 0;
+      break;
+    case 'R':
+      currentSubStepIndex = 0;
+      break;
+    case 'S':
+      currentStepIndex++;
+      currentSubStepIndex = 0;
+      if (currentStepIndex >= numMainSteps) currentStepIndex = numMainSteps - 1;
+      break;
+    case 'E':
+      isExecuting = true;
+      break;
+    case 'M':
+      Serial.println(F("== MENU: Digita numero test (es: 1..99) =="));
+      inMenu = true;
+      break;
+    default:
+      Serial.println(F("Comando non valido. Usa A/I/R/S/E/M o Q."));
   }
-}
-
-void enterMenu() {
-  Serial.println("\n-- MENÙ TEST DISPONIBILI --");
-  printAllTests();
-  Serial.print("Inserisci numero da 1 a ");
-  Serial.print(totalSteps);
-  Serial.println(" e premi INVIO:");
-  menuMode = true;
-  menuBufferIndex = 0;
-  memset(menuBuffer, 0, sizeof(menuBuffer));
-}
-
-// === Navigazione test ===
-bool hasStep(int mainIdx, int subIdx) {
-  Step step;
-  memcpy_P(&step, &testSequence[mainIdx][subIdx], sizeof(Step));
-  return step.desc != nullptr;
-}
-
-void nextStep() {
-  if (hasStep(currentMain, currentSub + 1)) {
-    currentSub++;
-  } else if (currentMain + 1 < numMainPoints) {
-    currentMain++;
-    currentSub = 0;
-  }
-}
-
-void prevStep() {
-  if (currentSub > 0) {
-    currentSub--;
-  } else if (currentMain > 0) {
-    currentMain--;
-    currentSub = 0;
-  }
-}
-
-void skipToNextMain() {
-  if (currentMain + 1 < numMainPoints) {
-    currentMain++;
-    currentSub = 0;
-  }
-}
-
-void startExecution() {
-  Step step;
-  memcpy_P(&step, &testSequence[currentMain][currentSub], sizeof(Step));
-  if (step.execute) {
-    currentStepFunction = step.execute;
-    isExecuting = true;
-    Serial.println(">> ESECUZIONE IN CORSO... premi Q per uscire");
-  }
-}
-
-void gotoStepByIndex(int idx) {
-  int count = 1;
-  for (int i = 0; i < numMainPoints; i++) {
-    for (int j = 0; hasStep(i, j); j++) {
-      if (count == idx) {
-        currentMain = i;
-        currentSub = j;
-        Serial.print("\n>> Selezionato test ");
-        Serial.println(idx);
-        printCurrentStep();
-        return;
-      }
-      count++;
-    }
-  }
-}
-
-int countTotalSteps() {
-  int count = 0;
-  for (int i = 0; i < numMainPoints; i++) {
-    for (int j = 0; hasStep(i, j); j++) {
-      count++;
-    }
-  }
-  return count;
 }
 
 void printCurrentStep() {
-  Serial.println("--------------------------------------------------");
-  Serial.println("A=Avanti | I=Indietro | R=Ripeti | S=Salta | E=Esegui | M=Menù | Q=Quit");
-
-  Step step;
-  memcpy_P(&step, &testSequence[currentMain][currentSub], sizeof(Step));
-
+  Step s;
+  memcpy_P(&s, &testSequence[currentStepIndex][currentSubStepIndex], sizeof(Step));
   char buffer[64];
-  if (step.desc != nullptr) {
-    strcpy_P(buffer, step.desc);
-    Serial.println(buffer);
-  } else {
-    Serial.println("(Nessun passo disponibile)");
-  }
-
-  Serial.println("--------------------------------------------------");
+  strcpy_P(buffer, (PGM_P)s.description);
+  Serial.println();
+  Serial.println(F("=========================="));
+  Serial.println(buffer);
+  Serial.println(F("Comandi: A=Avanti I=Indietro R=Ripeti S=Salta E=Esegui M=Menù Q=Stop"));
+  Serial.println(F("=========================="));
 }
 
-void printAllTests() {
-  int count = 1;
-  char buffer[64];
-  for (int i = 0; i < numMainPoints; i++) {
-    for (int j = 0; hasStep(i, j); j++) {
-      Step step;
-      memcpy_P(&step, &testSequence[i][j], sizeof(Step));
-      strcpy_P(buffer, step.desc);
-      Serial.print(count);
-      Serial.print(") ");
-      Serial.println(buffer);
-      count++;
-    }
+// Vai a test da menu
+void goToMenuStep(int index) {
+  if (index < 0 || index >= numMainSteps) {
+    Serial.println(F("Test non valido."));
+    return;
+  }
+  currentStepIndex = index;
+  currentSubStepIndex = 0;
+}
+
+// === ESECUZIONE TEST ===
+void test_initDAC() {
+  Serial.println(F(">> Simulo inizializzazione DAC"));
+  delay(1000);
+  isExecuting = false;
+}
+
+void test_generateTriangola() {
+  Serial.println(F(">> Simulo triangola 1Hz 5V"));
+  delay(1000);
+  isExecuting = false;
+}
+
+void test_blinkLED() {
+  unsigned long now = millis();
+  if (now - lastBlink >= 500) {
+    lastBlink = now;
+    ledState = !ledState;
+    digitalWrite(ledPin, ledState);
+    Serial.println(ledState ? F("LED ON") : F("LED OFF"));
   }
 }
